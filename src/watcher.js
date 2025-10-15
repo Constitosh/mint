@@ -1,3 +1,5 @@
+// WATCHER.JS
+
 import fetch from 'node-fetch';
 import { CONFIG } from './config.js';
 import { makeLucid, mintBothTo } from './mint.js';
@@ -86,7 +88,6 @@ async function fulfill() {
 
     // Do not mark payment processed; worker will retry next loop
   }
-}
 
 async function loop() {
   await scanPayments();
