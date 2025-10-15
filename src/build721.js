@@ -1,28 +1,62 @@
-import fs from 'fs';
-import { CONFIG } from './config.js';
+// src/build721.js
+import fs from "fs";
+import { CONFIG } from "./config.js";
 
-const DESCR = JSON.parse(fs.readFileSync(CONFIG.paths.collectionDescriptions, 'utf8'));
+const DESCR =
+  fs.existsSync(CONFIG.paths.collectionDescriptions)
+    ? JSON.parse(fs.readFileSync(CONFIG.paths.collectionDescriptions, "utf8"))
+    : {};
 
-function withDesc(policyId, obj){
-  // helpful normalizations
-  if (!obj.attributes && obj.traits) obj.attributes = obj.traits;
-  if (!obj.files) obj.files = [{ src: obj.image, mediaType: obj.mediaType }];
-  if (!obj.description && DESCR[policyId]?.description) obj.description = DESCR[policyId].description;
-  return obj;
+function ensureFiles(meta) {
+  if (!meta.files) {
+    meta.files = [{ src: meta.image, mediaType: meta.mediaType }];
+  }
 }
 
-export function build721(tddAssetObj, trixAssetObj){
-  // ❗ use the plain (string) asset names as keys
+function baseMeta(asset, policyId) {
+  const meta = {
+    name: asset.name,
+    image: asset.image,
+    mediaType: asset.mediaType,
+    cid: asset.cid,
+  };
+  // optional collection-wide description
+  const colDesc = DESCR[policyId]?.description;
+  if (asset.description) meta.description = asset.description;
+  else if (colDesc) meta.description = colDesc;
+  return meta;
+}
+
+function flattenTraitsInto(meta, asset) {
+  // Prefer "traits" if present; otherwise "attributes"
+  const src = asset.traits ?? asset.attributes ?? {};
+  for (const [k, v] of Object.entries(src)) {
+    // pool.pm is fine with strings; coerce simple values
+    meta[k] = typeof v === "string" ? v : JSON.stringify(v);
+  }
+  // Do NOT keep nested copies:
+  // (no meta.traits, no meta.attributes)
+}
+
+export function build721(tddAssetObj, trixAssetObj) {
+  // Keys MUST be the plain asset names (not hex) for CIP-25
   const tddKey  = tddAssetObj.name;
   const trixKey = trixAssetObj.name;
 
-  const tddObj  = withDesc(CONFIG.tddPolicyId,  { ...tddAssetObj });
-  const trixObj = withDesc(CONFIG.trixPolicyId, { ...trixAssetObj });
+  // ---- TDD ----
+  const tddMeta = baseMeta(tddAssetObj, CONFIG.tddPolicyId);
+  flattenTraitsInto(tddMeta, tddAssetObj);
+  ensureFiles(tddMeta);
 
-  // return the inner map directly (no extra "721" wrapper)
+  // ---- TRIX (2056) ----
+  const trixMeta = baseMeta(trixAssetObj, CONFIG.trixPolicyId);
+  flattenTraitsInto(trixMeta, trixAssetObj);
+  ensureFiles(trixMeta);
+
+  // Return the inner policy map (no outer "721" wrapper)
   return {
-    [CONFIG.tddPolicyId]:  { [tddKey]:  tddObj },
-    [CONFIG.trixPolicyId]: { [trixKey]: trixObj },
+    [CONFIG.tddPolicyId]:  { [tddKey]:  tddMeta },
+    [CONFIG.trixPolicyId]: { [trixKey]: trixMeta },
     version: "2.0",
   };
 }
