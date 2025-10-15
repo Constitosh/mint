@@ -1,7 +1,7 @@
 // src/mint.js
 import fs from 'fs';
 import fetch from 'node-fetch';
-import { Lucid, Blockfrost } from 'lucid-cardano';
+import { Lucid, Blockfrost, C } from 'lucid-cardano';
 import { CONFIG } from './config.js';
 import { build721 } from './build721.js';
 
@@ -10,8 +10,21 @@ const tddPolicyJson  = JSON.parse(fs.readFileSync(CONFIG.paths.tddPolicy, 'utf8'
 const trixPolicyJson = JSON.parse(fs.readFileSync(CONFIG.paths.trixPolicy, 'utf8'));
 
 // Read the policy signing keys (cardano-cli .skey JSON has cborHex)
-const tddSkeyCbor  = JSON.parse(fs.readFileSync('./policies/tdd/policy.skey', 'utf8')).cborHex;
-const trixSkeyCbor = JSON.parse(fs.readFileSync('./policies/trix2056/policy.skey', 'utf8')).cborHex;
+const tddSkeyCborHex  = JSON.parse(fs.readFileSync('./policies/tdd/policy.skey', 'utf8')).cborHex;
+const trixSkeyCborHex = JSON.parse(fs.readFileSync('./policies/trix2056/policy.skey', 'utf8')).cborHex;
+
+// Convert CLI .skey (CBOR-wrapped hex) -> bech32 ed25519_sk
+function skeyCborHexToBech32(cborHex) {
+  const bytes = Buffer.from(cborHex, 'hex');
+  // If CBOR definite-length bytes: 0x58 0x20 <32-bytes>
+  const isCborBytes = bytes.length === 34 && bytes[0] === 0x58 && bytes[1] === 0x20;
+  const raw = isCborBytes ? bytes.slice(2) : bytes; // unwrap if needed
+  const prv = C.PrivateKey.from_normal_bytes(raw);  // ed25519 (not extended)
+  return prv.to_bech32(); // "ed25519_sk1..."
+}
+
+const tddSkeyBech32  = skeyCborHexToBech32(tddSkeyCborHex);
+const trixSkeyBech32 = skeyCborHexToBech32(trixSkeyCborHex);
 
 let TDD_NATIVE_POLICY  = null;
 let TRIX_NATIVE_POLICY = null;
@@ -79,18 +92,18 @@ export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
       .newTx()
       .attachMintingPolicy(TDD_NATIVE_POLICY)
       .attachMintingPolicy(TRIX_NATIVE_POLICY)
-      // ⬇️ Mint one policy per call
+      // one policy per call:
       .mintAssets({ [tddUnit]: 1n })
       .mintAssets({ [trixUnit]: 1n })
-      // send both NFTs to the payer (Lucid will add min-ADA as needed)
       .payToAddress(toAddress, { [tddUnit]: 1n, [trixUnit]: 1n })
       .attachMetadata(721, metadata)
       .complete();
 
+    // 🔑 Sign with BOTH policy keys (bech32), then with the hot wallet
     const signed = await tx
-      .signWithPrivateKey(tddSkeyCbor)
-      .signWithPrivateKey(trixSkeyCbor)
-      .sign() // hot wallet from seedPhrase (fees/change)
+      .signWithPrivateKey(tddSkeyBech32)
+      .signWithPrivateKey(trixSkeyBech32)
+      .sign()
       .complete();
 
     const txHash = await signed.submit();
