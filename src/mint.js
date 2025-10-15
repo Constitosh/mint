@@ -16,10 +16,10 @@ const trixSkeyCborHex = JSON.parse(fs.readFileSync('./policies/trix2056/policy.s
 // Convert CLI .skey (CBOR-wrapped hex) -> bech32 ed25519_sk
 function skeyCborHexToBech32(cborHex) {
   const bytes = Buffer.from(cborHex, 'hex');
-  // If CBOR definite-length bytes: 0x58 0x20 <32-bytes>
+  // Common case: 0x58 0x20 <32-bytes>
   const isCborBytes = bytes.length === 34 && bytes[0] === 0x58 && bytes[1] === 0x20;
-  const raw = isCborBytes ? bytes.slice(2) : bytes; // unwrap if needed
-  const prv = C.PrivateKey.from_normal_bytes(raw);  // ed25519 (not extended)
+  const raw = isCborBytes ? bytes.slice(2) : bytes;
+  const prv = C.PrivateKey.from_normal_bytes(raw);
   return prv.to_bech32(); // "ed25519_sk1..."
 }
 
@@ -87,8 +87,17 @@ export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
 
   const metadata = build721(tddAssetObj, trixAssetObj);
 
+  // ✅ Ensure tx validity ends before the TRIX time-lock slot
+  const trixBefore = extractBeforeSlot(trixPolicyJson);
+  let validToMs = undefined;
+  if (trixBefore != null) {
+    // Lucid's validTo expects UNIX time (ms). Convert slot -> ms.
+    const ms = Number(lucid.utils.slotToUnixTime(trixBefore - 1));
+    validToMs = ms > 0 ? ms : undefined;
+  }
+
   try {
-    const tx = await lucid
+    let builder = lucid
       .newTx()
       .attachMintingPolicy(TDD_NATIVE_POLICY)
       .attachMintingPolicy(TRIX_NATIVE_POLICY)
@@ -96,10 +105,13 @@ export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
       .mintAssets({ [tddUnit]: 1n })
       .mintAssets({ [trixUnit]: 1n })
       .payToAddress(toAddress, { [tddUnit]: 1n, [trixUnit]: 1n })
-      .attachMetadata(721, metadata)
-      .complete();
+      .attachMetadata(721, metadata);
 
-    // 🔑 Sign with BOTH policy keys (bech32), then with the hot wallet
+    if (validToMs) builder = builder.validTo(validToMs);
+
+    const tx = await builder.complete();
+
+    // Sign with BOTH policy keys (bech32), then with the hot wallet
     const signed = await tx
       .signWithPrivateKey(tddSkeyBech32)
       .signWithPrivateKey(trixSkeyBech32)
