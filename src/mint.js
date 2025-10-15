@@ -5,7 +5,7 @@ import { Lucid, Blockfrost } from 'lucid-cardano';
 import { CONFIG } from './config.js';
 import { build721 } from './build721.js';
 
-// Load JSON native scripts from disk
+// Load JSON native scripts
 const tddPolicyJson  = JSON.parse(fs.readFileSync(CONFIG.paths.tddPolicy, 'utf8'));
 const trixPolicyJson = JSON.parse(fs.readFileSync(CONFIG.paths.trixPolicy, 'utf8'));
 
@@ -13,7 +13,6 @@ const trixPolicyJson = JSON.parse(fs.readFileSync(CONFIG.paths.trixPolicy, 'utf8
 const tddSkeyCbor  = JSON.parse(fs.readFileSync('./policies/tdd/policy.skey', 'utf8')).cborHex;
 const trixSkeyCbor = JSON.parse(fs.readFileSync('./policies/trix2056/policy.skey', 'utf8')).cborHex;
 
-// Module-scoped holders for the processed/native policies
 let TDD_NATIVE_POLICY  = null;
 let TRIX_NATIVE_POLICY = null;
 
@@ -44,28 +43,21 @@ export async function makeLucid() {
   );
   await lucid.selectWalletFromSeed(CONFIG.seedPhrase);
 
-  // 🔄 Convert plain JSON scripts -> Native minting policies Lucid understands
+  // Convert plain JSON -> native scripts
   TDD_NATIVE_POLICY  = lucid.utils.nativeScriptFromJson(tddPolicyJson);
   TRIX_NATIVE_POLICY = lucid.utils.nativeScriptFromJson(trixPolicyJson);
 
-  // ✅ Sanity-check the policy IDs computed from the actual policies
+  // Sanity-check computed policy IDs
   const tddComputed  = lucid.utils.mintingPolicyToId(TDD_NATIVE_POLICY);
   const trixComputed = lucid.utils.mintingPolicyToId(TRIX_NATIVE_POLICY);
+  if (tddComputed !== CONFIG.tddPolicyId)  throw new Error(`TDD policyId mismatch. Script=${tddComputed} env=${CONFIG.tddPolicyId}`);
+  if (trixComputed !== CONFIG.trixPolicyId) throw new Error(`TRIX policyId mismatch. Script=${trixComputed} env=${CONFIG.trixPolicyId}`);
 
-  if (tddComputed !== CONFIG.tddPolicyId) {
-    throw new Error(`TDD policyId mismatch. Script=${tddComputed} env=${CONFIG.tddPolicyId}`);
-  }
-  if (trixComputed !== CONFIG.trixPolicyId) {
-    throw new Error(`TRIX policyId mismatch. Script=${trixComputed} env=${CONFIG.trixPolicyId}`);
-  }
-
-  // ⏱ Timelock guard for TRIX (if present)
+  // Timelock guard (TRIX)
   const beforeSlot = extractBeforeSlot(trixPolicyJson);
   if (beforeSlot != null) {
     const now = await getLatestMainnetSlot();
-    if (now >= beforeSlot) {
-      throw new Error(`TRIX policy timelock expired (now=${now} >= before=${beforeSlot})`);
-    }
+    if (now >= beforeSlot) throw new Error(`TRIX policy timelock expired (now=${now} >= before=${beforeSlot})`);
   }
 
   return lucid;
@@ -85,19 +77,20 @@ export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
   try {
     const tx = await lucid
       .newTx()
-      // 🔗 Attach the processed/native policies (NOT the raw JSON)
       .attachMintingPolicy(TDD_NATIVE_POLICY)
       .attachMintingPolicy(TRIX_NATIVE_POLICY)
-      .mintAssets({ [tddUnit]: 1n, [trixUnit]: 1n })
-      .payToAddress(toAddress, { [tddUnit]: 1n, [trixUnit]: 1n }) // Lucid sets min-ADA as needed
+      // ⬇️ Mint one policy per call
+      .mintAssets({ [tddUnit]: 1n })
+      .mintAssets({ [trixUnit]: 1n })
+      // send both NFTs to the payer (Lucid will add min-ADA as needed)
+      .payToAddress(toAddress, { [tddUnit]: 1n, [trixUnit]: 1n })
       .attachMetadata(721, metadata)
       .complete();
 
-    // 🔑 Add signatures from BOTH policy keys, then sign with your hot wallet (fees/change)
     const signed = await tx
       .signWithPrivateKey(tddSkeyCbor)
       .signWithPrivateKey(trixSkeyCbor)
-      .sign()
+      .sign() // hot wallet from seedPhrase (fees/change)
       .complete();
 
     const txHash = await signed.submit();
