@@ -123,7 +123,7 @@ export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
         [tddUnit]: 1n,
         [trixUnit]: 1n,
       })
-      .attachMetadata(721, metadata);
+      .attachMetadata(721, metadata["721"])
 
     if (validToMs) builder = builder.validTo(validToMs);
 
