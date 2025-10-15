@@ -47,7 +47,13 @@ export function insertCatalog(collection, policyId, list) {
   `);
   const tx = db.transaction(() => {
     for (const it of list) {
-      stmt.run(collection, it.name, policyId, (it.cid || (it.image || '').replace('ipfs://', '')), it.mediaType);
+      stmt.run(
+        collection,
+        it.name,
+        policyId,
+        (it.cid || (it.image || '').replace('ipfs://', '')),
+        it.mediaType
+      );
     }
   });
   tx();
@@ -72,21 +78,61 @@ export function releaseReservation(assetId) {
   db.prepare(`UPDATE assets SET reserved=0 WHERE id=?`).run(assetId);
 }
 
+/** Free any reservations older than `seconds` (default 600s = 10 min). */
+export function expireOldReservations(seconds = 600) {
+  const res = db.prepare(`
+    UPDATE assets
+    SET reserved = 0
+    WHERE reserved = 1
+      AND reserved_at IS NOT NULL
+      AND reserved_at <= strftime('%s','now') - ?
+  `).run(seconds);
+  return res.changes; // number freed
+}
+
+/** Inventory counts for monitoring/health. */
+export function getInventoryCounts() {
+  const q = db.prepare(`
+    SELECT collection,
+           SUM(CASE WHEN minted=0 THEN 1 ELSE 0 END) AS remaining,
+           SUM(CASE WHEN minted=0 AND reserved=1 THEN 1 ELSE 0 END) AS reserved,
+           SUM(CASE WHEN minted=1 THEN 1 ELSE 0 END) AS minted
+    FROM assets
+    GROUP BY collection
+  `);
+  return q.all();
+}
+
+/** Payments */
 export function savePayment(tx_hash, payer, amount) {
-  db.prepare(`INSERT OR IGNORE INTO payments (tx_hash, payer_address, amount_lovelace) VALUES (?, ?, ?)`)
-    .run(tx_hash, payer, amount);
+  db.prepare(`
+    INSERT OR IGNORE INTO payments (tx_hash, payer_address, amount_lovelace)
+    VALUES (?, ?, ?)
+  `).run(tx_hash, payer, amount);
 }
+
 export function nextUnprocessedPayment(minLovelace) {
-  return db.prepare(`SELECT * FROM payments WHERE processed=0 AND amount_lovelace>=? ORDER BY rowid ASC`).get(minLovelace);
+  return db.prepare(`
+    SELECT * FROM payments
+    WHERE processed=0 AND amount_lovelace>=?
+    ORDER BY rowid ASC
+  `).get(minLovelace);
 }
+
 export function markPaymentProcessed(tx_hash) {
   db.prepare(`UPDATE payments SET processed=1 WHERE tx_hash=?`).run(tx_hash);
 }
 
 export function recordMint(payer, tx_hash, tddName, trixName) {
-  db.prepare(`INSERT INTO mints (tx_hash, payer_address, tdd_asset_name, trix_asset_name, created_at)
-              VALUES (?, ?, ?, ?, strftime('%s','now'))`)
-    .run(tx_hash, payer, tddName, trixName);
+  db.prepare(`
+    INSERT INTO mints (tx_hash, payer_address, tdd_asset_name, trix_asset_name, created_at)
+    VALUES (?, ?, ?, ?, strftime('%s','now'))
+  `).run(tx_hash, payer, tddName, trixName);
+}
+
+/** Optional: free stale reservations on startup */
+export function expireAllOnStartup(seconds = 600) {
+  return expireOldReservations(seconds);
 }
 
 if (process.argv.includes('--init')) {
