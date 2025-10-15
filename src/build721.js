@@ -1,41 +1,28 @@
 import fs from 'fs';
 import { CONFIG } from './config.js';
 
-const POLYFILL_DESC = JSON.parse(fs.readFileSync(CONFIG.paths.collectionDescriptions, 'utf8')); 
-// { "<policyId>": { "description": "..." } }
+const DESCR = JSON.parse(fs.readFileSync(CONFIG.paths.collectionDescriptions, 'utf8'));
 
-function toHex(text) {
-  return Buffer.from(text, 'utf8').toString('hex');
-}
+function toHex(s){ return Buffer.from(s, 'utf8').toString('hex'); }
 
-function withDescription(policyId, obj) {
-  // Attach a description if not present (marketplaces like it)
-  if (!obj.description && POLYFILL_DESC[policyId]?.description) {
-    obj.description = POLYFILL_DESC[policyId].description;
-  }
-  // (Optional) normalize traits->attributes without mutating source
-  if (obj.traits && !obj.attributes) {
-    obj.attributes = obj.traits;
-  }
+function withDesc(policyId, obj){
+  if (!obj.attributes && obj.traits) obj.attributes = obj.traits;
+  if (!obj.files) obj.files = [{ src: obj.image, mediaType: obj.mediaType }];
+  if (!obj.description && DESCR[policyId]?.description) obj.description = DESCR[policyId].description;
   return obj;
 }
 
-export function build721(tddAssetObj, trixAssetObj) {
-  const tddKey = toHex(tddAssetObj.name);
+export function build721(tddAssetObj, trixAssetObj){
+  const tddKey  = toHex(tddAssetObj.name);
   const trixKey = toHex(trixAssetObj.name);
 
-  const tddObj = withDescription(CONFIG.tddPolicyId, structuredClone(tddAssetObj));
-  const trixObj = withDescription(CONFIG.trixPolicyId, structuredClone(trixAssetObj));
+  const tddObj  = withDesc(CONFIG.tddPolicyId,  { ...tddAssetObj });
+  const trixObj = withDesc(CONFIG.trixPolicyId, { ...trixAssetObj });
 
-  // Add files[] helper for previews if missing
-  if (!tddObj.files) tddObj.files = [{ src: tddObj.image, mediaType: tddObj.mediaType }];
-  if (!trixObj.files) trixObj.files = [{ src: trixObj.image, mediaType: trixObj.mediaType }];
-
+  // NOTE: return the inner map directly
   return {
-    721: {
-      [CONFIG.tddPolicyId]: { [tddKey]: tddObj },
-      [CONFIG.trixPolicyId]: { [trixKey]: trixObj },
-      version: '2.0',
-    },
+    [CONFIG.tddPolicyId]:  { [tddKey]:  tddObj },
+    [CONFIG.trixPolicyId]: { [trixKey]: trixObj },
+    version: "2.0",
   };
 }
