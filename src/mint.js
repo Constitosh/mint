@@ -77,7 +77,8 @@ export async function makeLucid() {
 }
 
 export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
-  if (!tddAssetObj || !trixAssetObj) throw new Error("Asset lookup failed");
+  if (!tddAssetObj || !trixAssetObj)
+    throw new Error("Asset lookup failed");
 
   const tddNameHex  = Buffer.from(tddAssetObj.name,  'utf8').toString('hex');
   const trixNameHex = Buffer.from(trixAssetObj.name, 'utf8').toString('hex');
@@ -87,13 +88,25 @@ export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
 
   const metadata = build721(tddAssetObj, trixAssetObj);
 
-  // ✅ Ensure tx validity ends before the TRIX time-lock slot
-  const trixBefore = extractBeforeSlot(trixPolicyJson);
-  let validToMs = undefined;
-  if (trixBefore != null) {
-    // Lucid's validTo expects UNIX time (ms). Convert slot -> ms.
+  // ✅ include at least 2 ADA (in lovelace) with the NFTs
+  const MIN_ADA_FOR_NFT_OUTPUT = 2_000_000n;
+
+  // figure out timelock slot for TRIX
+  const trixBefore = (function extract(policy){
+    if (!policy) return null;
+    if (policy.type === "before") return policy.slot;
+    const arr = policy.scripts || [];
+    for (const s of arr) {
+      const x = extract(s);
+      if (x != null) return x;
+    }
+    return null;
+  })(JSON.parse(fs.readFileSync(CONFIG.paths.trixPolicy, "utf8")));
+
+  let validToMs;
+  if (trixBefore) {
     const ms = Number(lucid.utils.slotToUnixTime(trixBefore - 1));
-    validToMs = ms > 0 ? ms : undefined;
+    if (ms > 0) validToMs = ms;
   }
 
   try {
@@ -101,17 +114,22 @@ export async function mintBothTo(lucid, toAddress, tddAssetObj, trixAssetObj) {
       .newTx()
       .attachMintingPolicy(TDD_NATIVE_POLICY)
       .attachMintingPolicy(TRIX_NATIVE_POLICY)
-      // one policy per call:
+      // one mintAssets per policy
       .mintAssets({ [tddUnit]: 1n })
       .mintAssets({ [trixUnit]: 1n })
-      .payToAddress(toAddress, { [tddUnit]: 1n, [trixUnit]: 1n })
+      // 👇 this is the important part — add 2 ADA + the two NFTs
+      .payToAddress(toAddress, {
+        lovelace: MIN_ADA_FOR_NFT_OUTPUT,
+        [tddUnit]: 1n,
+        [trixUnit]: 1n,
+      })
       .attachMetadata(721, metadata);
 
     if (validToMs) builder = builder.validTo(validToMs);
 
     const tx = await builder.complete();
 
-    // Sign with BOTH policy keys (bech32), then with the hot wallet
+    // sign with both policy keys + hot wallet
     const signed = await tx
       .signWithPrivateKey(tddSkeyBech32)
       .signWithPrivateKey(trixSkeyBech32)
