@@ -77,10 +77,13 @@ async function fulfill() {
     recordMint(payer, txHash, tddRow.asset_name, trixRow.asset_name);
     markPaymentProcessed(payment.tx_hash);
     console.log(`[MINTED] ${tddRow.asset_name} + ${trixRow.asset_name} -> ${payer} | ${txHash}`);
-  } catch (e) {
-    console.error('[mint error] releasing reservations', e.message);
-    releaseReservation(tddRow.id);
-    releaseReservation(trixRow.id);
+} catch (e) {
+  console.error('[mint error] releasing reservations', e?.stack || e?.message || e);
+  releaseReservation(tddRow.id);
+  releaseReservation(trixRow.id);
+  // keep payment unprocessed so it retries after you fix
+}
+
     // Do not mark payment processed; worker will retry next loop
   }
 }
