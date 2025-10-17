@@ -63,31 +63,71 @@ function lovelaceToOurAddress(utxos, ourAddr) {
   return total;
 }
 
+// ------------ Blockfrost helpers ------------
+async function getIncomingTxs(address) {
+  const url = `https://cardano-mainnet.blockfrost.io/api/v0/addresses/${address}/transactions?order=desc&count=25`;
+  const resp = await fetch(url, { headers: { project_id: CONFIG.blockfrostKey } });
+  if (!resp.ok) throw new Error(`Blockfrost address txs ${resp.status}`);
+  return resp.json(); // [{ tx_hash, ... }]
+}
+
+async function getTxUtxos(tx_hash) {
+  const url = `https://cardano-mainnet.blockfrost.io/api/v0/txs/${tx_hash}/utxos`;
+  const resp = await fetch(url, { headers: { project_id: CONFIG.blockfrostKey } });
+  if (!resp.ok) throw new Error(`Blockfrost utxos ${resp.status}`);
+  return resp.json();
+}
+
+async function hasLabel721(tx_hash) {
+  const url = `https://cardano-mainnet.blockfrost.io/api/v0/txs/${tx_hash}/metadata`;
+  const resp = await fetch(url, { headers: { project_id: CONFIG.blockfrostKey } });
+  if (!resp.ok) return false; // if metadata not available, treat as no-721
+  const items = await resp.json();
+  return Array.isArray(items) && items.some((m) => m.label === "721");
+}
+
+function lovelaceToOurAddress(utxos, ourAddr) {
+  let total = 0n;
+  for (const out of utxos.outputs || []) {
+    if (out.address !== ourAddr) continue;
+    const ll = BigInt(out.amount.find((a) => a.unit === 'lovelace')?.quantity || '0');
+    total += ll;
+  }
+  return total;
+}
+
 // ------------ Scan payments ------------
 async function scanPayments() {
   try {
     const txs = await getIncomingTxs(CONFIG.mintAddress);
     for (const t of txs) {
       const utxos = await getTxUtxos(t.tx_hash);
-      const amt = lovelaceToOurAddress(utxos, CONFIG.mintAddress);
-      if (amt === 0n) continue;
 
-      // accept only 30 ₳ ± tolerance
-      if (amt < MIN_ACCEPT || amt > MAX_ACCEPT) {
-        // Ignore unexpected amounts; optionally log
-        // console.log(`[scanPayments] Ignored ${Number(amt)/1e6} ₳ (out of range) for tx ${t.tx_hash}`);
-        continue;
-      }
+      // 1) Ignore txs that our own wallet created (any input from mint address)
+      const fromUs = (utxos.inputs || []).some((i) => i.address === CONFIG.mintAddress);
+      if (fromUs) continue;
 
-      // Guess payer as the address of the first input
-      const payer = utxos.inputs?.[0]?.address || 'unknown';
-      savePayment(t.tx_hash, payer, Number(amt));
+      // 2) Ignore txs that already carry CIP-25 metadata (very likely our mint txs)
+      const meta721 = await hasLabel721(t.tx_hash);
+      if (meta721) continue;
+
+      // 3) Sum actual lovelace paid to our mint address in this tx
+      const amountL = lovelaceToOurAddress(utxos, CONFIG.mintAddress);
+      if (amountL === 0n) continue;
+
+      // 4) Accept only 30 ₳ ± tolerance
+      if (amountL < MIN_ACCEPT || amountL > MAX_ACCEPT) continue;
+
+      // 5) Record payment with the payer = first input address
+      const payer = utxos.inputs?.[0]?.address || null;
+      if (!payer) continue; // cannot pay to null
+
+      savePayment(t.tx_hash, payer, Number(amountL));
     }
   } catch (e) {
     console.error('[scanPayments]', e?.stack || e?.message || e);
   }
 }
-
 // ------------ Fulfill a single payment ------------
 async function fulfill() {
   // Free stale reservations every loop (10 minutes)
