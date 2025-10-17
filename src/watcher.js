@@ -19,51 +19,44 @@ import {
 
 init();
 
-// Catalogs (kept in memory for fast lookup)
+// Load catalogs once
 const TDD_LIST  = JSON.parse(fs.readFileSync(CONFIG.paths.tddJson));
 const TRIX_LIST = JSON.parse(fs.readFileSync(CONFIG.paths.trixJson));
 
-// Free stale reservations on startup (10 minutes)
+// Free stale reservations on boot
 expireAllOnStartup(600);
 
-// Helpers
-const adaToLovelace = (ada) => BigInt(Math.floor(ada * 1_000_000));
-const PRICE = Number(CONFIG.priceAda || 30);
-const TOLERANCE_ADA = 0.5;                           // +/- 0.5 ₳ window
-const MIN_ACCEPT = adaToLovelace(PRICE - TOLERANCE_ADA);
-const MAX_ACCEPT = adaToLovelace(PRICE + TOLERANCE_ADA);
+// -------- Settings --------
+const PRICE_ADA = Number(CONFIG.priceAda || 30);
+const TOLERANCE_ADA = Number(CONFIG.priceToleranceAda ?? 0.5); // set to 0.0 for exact 30.000000
+const adaToLovelace = (ada) => BigInt(Math.round(ada * 1_000_000));
+const MIN_ACCEPT = adaToLovelace(PRICE_ADA - TOLERANCE_ADA);
+const MAX_ACCEPT = adaToLovelace(PRICE_ADA + TOLERANCE_ADA);
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Simple in-process mutex so only one mint runs at a time
+// Simple in-process lock to avoid UTxO collisions
 let MINTING = false;
 
-// ------------ Blockfrost helpers ------------
-async function getIncomingTxs(address) {
-  const url = `https://cardano-mainnet.blockfrost.io/api/v0/addresses/${address}/transactions?order=desc&count=25`;
-  const resp = await fetch(url, { headers: { project_id: CONFIG.blockfrostKey } });
-  if (!resp.ok) throw new Error(`Blockfrost address txs ${resp.status}`);
-  return resp.json(); // [{ tx_hash, ... }]
-}
+// Cache a set of "our addresses" (mint address + wallet addresses)
+const OUR_ADDRS = new Set([CONFIG.mintAddress]);
 
-async function getTxUtxos(tx_hash) {
-  const url = `https://cardano-mainnet.blockfrost.io/api/v0/txs/${tx_hash}/utxos`;
-  const resp = await fetch(url, { headers: { project_id: CONFIG.blockfrostKey } });
-  if (!resp.ok) throw new Error(`Blockfrost utxos ${resp.status}`);
-  return resp.json();
-}
-
-// Sum all lovelace sent to our mint address within this tx
-function lovelaceToOurAddress(utxos, ourAddr) {
-  let total = 0n;
-  for (const out of utxos.outputs || []) {
-    if (out.address !== ourAddr) continue;
-    const ll = BigInt(out.amount.find((a) => a.unit === 'lovelace')?.quantity || '0');
-    total += ll;
+(async () => {
+  try {
+    const lucid = await makeLucid();
+    // Base (payment) address the wallet would use
+    const walletAddr = await lucid.wallet.address();
+    // Change address (often different)
+    const changeAddr = await lucid.wallet.changeAddress();
+    OUR_ADDRS.add(walletAddr);
+    OUR_ADDRS.add(changeAddr);
+    console.log('[watcher] Our addresses cached:', [...OUR_ADDRS].map(a => a.slice(0,24)+'...'));
+  } catch (e) {
+    console.warn('[watcher] Could not preload wallet addresses (will still work):', e?.message || e);
   }
-  return total;
-}
+})();
 
-// ------------ Blockfrost helpers ------------
+// -------- Blockfrost helpers --------
 async function getIncomingTxs(address) {
   const url = `https://cardano-mainnet.blockfrost.io/api/v0/addresses/${address}/transactions?order=desc&count=25`;
   const resp = await fetch(url, { headers: { project_id: CONFIG.blockfrostKey } });
@@ -81,7 +74,7 @@ async function getTxUtxos(tx_hash) {
 async function hasLabel721(tx_hash) {
   const url = `https://cardano-mainnet.blockfrost.io/api/v0/txs/${tx_hash}/metadata`;
   const resp = await fetch(url, { headers: { project_id: CONFIG.blockfrostKey } });
-  if (!resp.ok) return false; // if metadata not available, treat as no-721
+  if (!resp.ok) return false;
   const items = await resp.json();
   return Array.isArray(items) && items.some((m) => m.label === "721");
 }
@@ -96,48 +89,74 @@ function lovelaceToOurAddress(utxos, ourAddr) {
   return total;
 }
 
-// ------------ Scan payments ------------
+/**
+ * tx is "from us" only if ALL inputs belong to our known addresses.
+ * (User payments should have zero inputs from OUR_ADDRS.)
+ */
+function isFromUs(utxos) {
+  const ins = utxos.inputs || [];
+  if (!ins.length) return false;
+  return ins.every((i) => OUR_ADDRS.has(i.address));
+}
+
+// -------- Scan payments --------
 async function scanPayments() {
   try {
     const txs = await getIncomingTxs(CONFIG.mintAddress);
+
     for (const t of txs) {
-      const utxos = await getTxUtxos(t.tx_hash);
+      const txHash = t.tx_hash;
+      const utxos = await getTxUtxos(txHash);
+      const amt = lovelaceToOurAddress(utxos, CONFIG.mintAddress);
 
-      // 1) Ignore txs that our own wallet created (any input from mint address)
-      const fromUs = (utxos.inputs || []).some((i) => i.address === CONFIG.mintAddress);
-      if (fromUs) continue;
+      if (amt === 0n) {
+        // no ada to us
+        continue;
+      }
 
-      // 2) Ignore txs that already carry CIP-25 metadata (very likely our mint txs)
-      const meta721 = await hasLabel721(t.tx_hash);
-      if (meta721) continue;
+      // Guard 1: skip if tx is ours (all inputs from our own wallet/addrs)
+      const fromUs = isFromUs(utxos);
+      if (fromUs) {
+        // console.log(`[scan] skip (from us): ${txHash}`);
+        continue;
+      }
 
-      // 3) Sum actual lovelace paid to our mint address in this tx
-      const amountL = lovelaceToOurAddress(utxos, CONFIG.mintAddress);
-      if (amountL === 0n) continue;
+      // Guard 2: skip if tx already has 721 metadata (likely our own mint tx)
+      const meta721 = await hasLabel721(txHash);
+      if (meta721) {
+        // console.log(`[scan] skip (has 721): ${txHash}`);
+        continue;
+      }
 
-      // 4) Accept only 30 ₳ ± tolerance
-      if (amountL < MIN_ACCEPT || amountL > MAX_ACCEPT) continue;
+      // Amount window
+      if (amt < MIN_ACCEPT || amt > MAX_ACCEPT) {
+        console.log(`[scan] ignore amount ${Number(amt)/1e6}₳ (accept ${Number(MIN_ACCEPT)/1e6}–${Number(MAX_ACCEPT)/1e6}) tx=${txHash}`);
+        continue;
+      }
 
-      // 5) Record payment with the payer = first input address
       const payer = utxos.inputs?.[0]?.address || null;
-      if (!payer) continue; // cannot pay to null
+      if (!payer) {
+        console.log(`[scan] skip (no payer addr) tx=${txHash}`);
+        continue;
+      }
 
-      savePayment(t.tx_hash, payer, Number(amountL));
+      // Save payment (idempotent via unique key)
+      savePayment(txHash, payer, Number(amt));
+      console.log(`[scan] payment recorded: ${Number(amt)/1e6}₳ from ${payer.slice(0,32)}... tx=${txHash}`);
     }
   } catch (e) {
     console.error('[scanPayments]', e?.stack || e?.message || e);
   }
 }
-// ------------ Fulfill a single payment ------------
+
+// -------- Fulfill exactly one payment --------
 async function fulfill() {
-  // Free stale reservations every loop (10 minutes)
+  // expire reservations
   const freed = expireOldReservations(600);
   if (freed) console.log(`[reserve-expiry] freed ${freed} stale reservations`);
 
-  // Only one mint in flight
   if (MINTING) return;
 
-  // Next paid but unprocessed tx
   const payment = nextUnprocessedPayment(Number(MIN_ACCEPT));
   if (!payment) return;
 
@@ -146,17 +165,14 @@ async function fulfill() {
     const lucid = await makeLucid();
     const payer = payment.payer_address;
 
-    // Reserve random assets
+    // reserve inventory
     const tddRow  = pickRandomAvailable('TDD');
     const trixRow = pickRandomAvailable('TRIX_2056');
-
     if (!tddRow || !trixRow) {
       console.error('Sold out or inventory empty.', getInventoryCounts());
-      // Do NOT mark as processed; you might restock or handle refund separately
       return;
     }
 
-    // Lookup full metadata entries
     const tddAsset  = TDD_LIST.find((x) => x.name === tddRow.asset_name);
     const trixAsset = TRIX_LIST.find((x) => x.name === trixRow.asset_name);
     if (!tddAsset)  throw new Error(`TDD asset not found in JSON: ${tddRow.asset_name}`);
@@ -165,10 +181,10 @@ async function fulfill() {
     try {
       const txHash = await mintBothTo(lucid, payer, tddAsset, trixAsset);
 
-      // Wait for confirmation so our change UTxOs are spendable next time
+      // wait for confirmation to avoid double-spending change
       await lucid.awaitTx(txHash);
 
-      // Persist + mark done
+      // persist
       markMinted(tddRow.id);
       markMinted(trixRow.id);
       recordMint(payer, txHash, tddRow.asset_name, trixRow.asset_name);
@@ -176,20 +192,20 @@ async function fulfill() {
 
       console.log(`[MINTED] ${tddRow.asset_name} + ${trixRow.asset_name} -> ${payer} | ${txHash}`);
 
-      // Small backoff to avoid racing next loop
+      // small backoff
       await sleep(1500);
     } catch (e) {
       console.error('[mint error] releasing reservations', e?.stack || e?.message || e);
-      // Free assets; keep payment unprocessed so it retries after fix
       releaseReservation(tddRow.id);
       releaseReservation(trixRow.id);
+      // leave payment unprocessed; will retry next loop
     }
   } finally {
     MINTING = false;
   }
 }
 
-// ------------ Main loop ------------
+// -------- Loop --------
 async function loop() {
   await scanPayments();
   await fulfill();
