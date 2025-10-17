@@ -1,0 +1,108 @@
+Stop the worker:
+
+pm2 stop mint-worker
+
+
+Run the script:
+
+NODE_OPTIONS=--experimental-fetch node scripts/burn.js
+
+
+After success, the tx hash is printed. Wait for confirmation (lucid.awaitTx(txHash) or check on chain).
+
+Alternate: cardano-cli outline (more manual, longer)
+
+If you prefer cardano-cli, burning requires:
+
+Gather a UTxO from your wallet that contains the tokens (use cardano-cli query utxo ... or Blockfrost).
+
+Build a raw tx that:
+
+Spends that UTxO
+
+Includes the mint field with -1 <policyID.hexName>
+
+Includes an output for change (with enough lovelace)
+
+Set fee = estimated
+
+Sign with the wallet signing key and the policy signing key (--signing-key-file policy.skey and --signing-key-file payment.skey).
+
+Submit.
+
+Because cardano-cli is more brittle and requires node socket paths etc., I recommend the Lucid script above.
+
+After burning: mark rows in SQLite as un-minted (free them)
+
+If you want the same asset names to be mintable again by your worker, update your DB to set minted=0 and reserved=0 for those rows.
+
+Example SQL (use sqlite3 CLI)
+
+Replace the names with the exact asset names:
+
+# open DB shell
+sqlite3 /path/to/your/sqlite.db
+
+# inside sqlite> prompt run:
+UPDATE assets
+SET minted=0, reserved=0, reserved_at=NULL
+WHERE collection='TRIX_2056' AND asset_name IN ('2056_35','2056_52');
+
+UPDATE assets
+SET minted=0, reserved=0, reserved_at=NULL
+WHERE collection='TDD' AND asset_name IN ('DDCXXXII_18','DDCXXXII_41');
+
+-- optionally remove the mints row(s) if you want
+DELETE FROM mints WHERE tdd_asset_name IN ('DDCXXXII_18','DDCXXXII_41') OR trix_asset_name IN ('2056_35','2056_52');
+
+.mode column
+.headers on
+SELECT * FROM assets WHERE asset_name LIKE '2056_%' LIMIT 20;
+.quit
+
+
+Or from shell one-liners:
+
+sqlite3 /path/to/your/sqlite.db "UPDATE assets SET minted=0,reserved=0,reserved_at=NULL WHERE collection='TRIX_2056' AND asset_name IN ('2056_35','2056_52');"
+
+
+Important: the asset_name in DB must exactly match the name strings used in your metadata (case-sensitive). Double-check names before running updates.
+
+Alternative workflow: reclaim from holders (if holders have them)
+
+If the tokens are already in user wallets (not your hot wallet), you can:
+
+Ask holders to send them back (possibly incentivize with small ADA) and burn them when received, OR
+
+Mint replacement tokens under a new naming convention (e.g., append _v2) and airdrop them to holders — easier but creates two versions.
+
+After DB changes: resume worker
+
+Once you burned and updated DB:
+
+Restart watcher:
+
+pm2 restart mint-worker   # or pm2 start
+
+
+Verify DB rows are now minted=0 and available to be picked:
+
+sqlite3 /path/to/your/sqlite.db "SELECT id,collection,asset_name,minted,reserved FROM assets WHERE asset_name IN ('2056_35','DDCXXXII_18');"
+
+Checklist (summary)
+
+Backup DB.
+
+Stop mint-worker.
+
+Confirm you control the tokens and policy skeys.
+
+Use scripts/burn.js (recommended) to burn the desired units.
+
+Wait for on-chain confirmation.
+
+Update SQLite: minted=0,reserved=0 for those asset rows (exact names). Optionally delete mints rows.
+
+Restart the worker.
+
+Test by sending a 30₳ payment from test wallet and confirm the asset can be minted again.
