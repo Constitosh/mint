@@ -1,0 +1,4 @@
+const TO_BURN = [
+  { policyId: "0ecb97...58237", name: "2056_35" },
+  { policyId: "a64835...9dfb", name: "DDCXXXII_18" },
+];
