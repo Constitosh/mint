@@ -3,8 +3,9 @@
 // Burns the listed assets (1 unit each). Uses policy keys + wallet seed from config.
 
 import fs from "fs";
+import fetch from "node-fetch";
 import { Lucid, Blockfrost, C } from "lucid-cardano";
-import { CONFIG } from "../src/config.js"; // adjust path if needed
+import { CONFIG } from "../src/config.js";
 
 // =======================================
 // 🔥 LIST OF ASSETS TO BURN
@@ -61,7 +62,6 @@ const SEED = CONFIG.seedPhrase;
 // =======================================
 // 🔧 HELPERS
 // =======================================
-
 function readPolicyKey(path) {
   const json = JSON.parse(fs.readFileSync(path, "utf8"));
   let hex = json.cborHex;
@@ -72,7 +72,29 @@ function readPolicyKey(path) {
 function toBech32FromHexKey(hex) {
   const bytes = Buffer.from(hex, "hex");
   const prv = C.PrivateKey.from_normal_bytes(bytes);
-  return prv.to_bech32(); // e.g. ed25519_sk1...
+  return prv.to_bech32(); // ed25519_sk1...
+}
+
+// 🔍 Check wallet holdings before burning
+async function walletHasAssets(blockfrostKey, walletAddr, units) {
+  const missing = [];
+  const resp = await fetch(`https://cardano-mainnet.blockfrost.io/api/v0/addresses/${walletAddr}/utxos`, {
+    headers: { project_id: blockfrostKey },
+  });
+  if (!resp.ok) throw new Error("Blockfrost utxo fetch failed: " + resp.status);
+  const utxos = await resp.json();
+
+  const owned = new Set();
+  for (const u of utxos) {
+    for (const amt of u.amount) {
+      if (amt.unit !== "lovelace") owned.add(amt.unit);
+    }
+  }
+
+  for (const u of units) {
+    if (!owned.has(u)) missing.push(u);
+  }
+  return { ok: missing.length === 0, missing };
 }
 
 // =======================================
@@ -90,52 +112,60 @@ async function main() {
   );
   await lucid.selectWalletFromSeed(SEED);
 
-  // Load both policy objects and convert keys
-  const policies = {};
+  const walletAddr = await lucid.wallet.address();
+  console.log("🔥 Using wallet address:", walletAddr);
 
+  // Load both policy objects
+  const policies = {};
   const trixHex = readPolicyKey(TRIX_SKEY_FILE);
   policies[CONFIG.trixPolicyId] = {
     scriptJson: JSON.parse(fs.readFileSync(TRIX_POLICY_FILE, "utf8")),
     bech32: toBech32FromHexKey(trixHex)
   };
-
   const tddHex = readPolicyKey(TDD_SKEY_FILE);
   policies[CONFIG.tddPolicyId] = {
     scriptJson: JSON.parse(fs.readFileSync(TDD_POLICY_FILE, "utf8")),
     bech32: toBech32FromHexKey(tddHex)
   };
 
-  // Convert scripts to Lucid nativeScript
   const nativePolicies = {};
   for (const pid of Object.keys(policies)) {
     nativePolicies[pid] = lucid.utils.nativeScriptFromJson(policies[pid].scriptJson);
   }
 
-  // Build mint object: negative counts for burning
+  // Build burn map and collect all asset units
   const burnByPolicy = {};
+  const allUnits = [];
   for (const it of TO_BURN) {
     if (!burnByPolicy[it.policyId]) burnByPolicy[it.policyId] = {};
     const hexName = Buffer.from(it.name, "utf8").toString("hex");
     const unit = it.policyId + hexName;
     burnByPolicy[it.policyId][unit] = -1n;
+    allUnits.push(unit);
   }
+
+  // 🧩 Verify holdings
+  console.log("Checking wallet holdings via Blockfrost...");
+  const check = await walletHasAssets(CONFIG.blockfrostKey, walletAddr, allUnits);
+  if (!check.ok) {
+    console.error("🚫 Missing assets in wallet. Cannot burn these units:");
+    for (const u of check.missing) console.error(" - " + u);
+    process.exit(1);
+  }
+  console.log("✅ All assets are present in the wallet. Proceeding with burn.");
 
   try {
     let builder = lucid.newTx();
-
     for (const pid of Object.keys(burnByPolicy)) {
       const native = nativePolicies[pid];
-      if (!native) throw new Error("Missing native policy " + pid);
       builder = builder.attachMintingPolicy(native);
     }
-
     for (const pid of Object.keys(burnByPolicy)) {
       builder = builder.mintAssets(burnByPolicy[pid]);
     }
 
     const tx = await builder.complete();
 
-    // 🧪 Dry-run (no submission)
     if (DRY_RUN) {
       console.log("──────────────────────────────────────────────");
       console.log("Dry-run mode ON — transaction NOT submitted.");
@@ -143,12 +173,10 @@ async function main() {
       for (const it of TO_BURN)
         console.log(` • ${it.policyId.slice(0,8)}…${it.policyId.slice(-6)} : ${it.name}`);
       console.log("──────────────────────────────────────────────");
-      const fee = tx.txComplete.body().fee().to_str();
-      console.log("Estimated minimum ADA fee:", fee);
+      console.log("Estimated minimum ADA fee:", tx.txComplete.body().fee().to_str());
       process.exit(0);
     }
 
-    // 🔐 Sign with both policy keys and wallet
     let signed = tx;
     for (const pid of Object.keys(burnByPolicy)) {
       const bech = policies[pid].bech32;
@@ -157,11 +185,9 @@ async function main() {
     }
     signed = await signed.sign().complete();
 
-    // 🪓 Submit
     const txHash = await signed.submit();
     console.log("✅ Burn tx submitted:", txHash);
     process.exit(0);
-
   } catch (e) {
     console.error("Burn failed:", e);
     process.exit(1);
