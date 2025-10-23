@@ -1,13 +1,14 @@
 // scripts/burn.js
 // Usage: NODE_OPTIONS=--experimental-fetch node scripts/burn.js
-// Put asset units to burn in the `TO_BURN` array as objects { policyId, name }.
-// It will burn 1 unit of each listed asset under its policy.
+// Burns the listed assets (1 unit each). Uses policy keys + wallet seed from config.
 
 import fs from "fs";
-import { Lucid, Blockfrost } from "lucid-cardano";
+import { Lucid, Blockfrost, C } from "lucid-cardano";
 import { CONFIG } from "../src/config.js"; // adjust path if needed
 
-// EDIT THIS: list of assets to burn (policy + plain name)
+// =======================================
+// 🔥 LIST OF ASSETS TO BURN
+// =======================================
 const TO_BURN = [
   // ===== TRIX policy =====
   { policyId: "0ecb97dba8b3dbcaf004410717df9a214d526b1732bc88d14ca58237", name: "2056_2" },
@@ -40,29 +41,42 @@ const TO_BURN = [
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_84" },
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_86" },
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_90" },
-  { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "tddtddCXXXI-0040" },
 ];
 
-// Toggle true to only simulate (no submission)
-const DRY_RUN = false;
+// ✅ Toggle to test without sending a real transaction
+const DRY_RUN = true;
 
-// Paths to policy script and key files
+// =======================================
+// 🗝️ FILE PATHS
+// =======================================
 const TRIX_POLICY_FILE = "./policies/trix2056/policy.script";
 const TRIX_SKEY_FILE   = "./policies/trix2056/policy.skey";
 const TDD_POLICY_FILE  = "./policies/tdd/policy.script";
 const TDD_SKEY_FILE    = "./policies/tdd/policy.skey";
 
-// wallet seed (the hot wallet that holds tokens & will pay fees)
+// Wallet seed for fees
 const SEED = CONFIG.seedPhrase;
 
-// --- Helper: read raw ed25519 key bytes from CLI JSON skey ---
+// =======================================
+// 🔧 HELPERS
+// =======================================
+
 function readPolicyKey(path) {
   const json = JSON.parse(fs.readFileSync(path, "utf8"));
-  // strip CBOR prefix (5820 = 0x58 0x20) if present
-  if (json.cborHex.startsWith("5820")) return json.cborHex.slice(4);
-  return json.cborHex;
+  let hex = json.cborHex;
+  if (hex.startsWith("5820")) hex = hex.slice(4); // remove CBOR prefix
+  return hex;
 }
 
+function toBech32FromHexKey(hex) {
+  const bytes = Buffer.from(hex, "hex");
+  const prv = C.PrivateKey.from_normal_bytes(bytes);
+  return prv.to_bech32(); // e.g. ed25519_sk1...
+}
+
+// =======================================
+// 🧠 MAIN
+// =======================================
 async function main() {
   if (!TO_BURN.length) {
     console.log("No assets in TO_BURN. Exiting.");
@@ -75,26 +89,28 @@ async function main() {
   );
   await lucid.selectWalletFromSeed(SEED);
 
-  // load policy objects / keys
+  // Load both policy objects and convert keys
   const policies = {};
-  // TRIX
+
+  const trixHex = readPolicyKey(TRIX_SKEY_FILE);
   policies[CONFIG.trixPolicyId] = {
     scriptJson: JSON.parse(fs.readFileSync(TRIX_POLICY_FILE, "utf8")),
-    rawHex: readPolicyKey(TRIX_SKEY_FILE)
-  };
-  // TDD
-  policies[CONFIG.tddPolicyId] = {
-    scriptJson: JSON.parse(fs.readFileSync(TDD_POLICY_FILE, "utf8")),
-    rawHex: readPolicyKey(TDD_SKEY_FILE)
+    bech32: toBech32FromHexKey(trixHex)
   };
 
-  // convert scripts -> native policies Lucid understands
+  const tddHex = readPolicyKey(TDD_SKEY_FILE);
+  policies[CONFIG.tddPolicyId] = {
+    scriptJson: JSON.parse(fs.readFileSync(TDD_POLICY_FILE, "utf8")),
+    bech32: toBech32FromHexKey(tddHex)
+  };
+
+  // Convert scripts to Lucid nativeScript
   const nativePolicies = {};
   for (const pid of Object.keys(policies)) {
     nativePolicies[pid] = lucid.utils.nativeScriptFromJson(policies[pid].scriptJson);
   }
 
-  // build mint object: negative counts to burn
+  // Build mint object: negative counts for burning
   const burnByPolicy = {};
   for (const it of TO_BURN) {
     if (!burnByPolicy[it.policyId]) burnByPolicy[it.policyId] = {};
@@ -106,23 +122,19 @@ async function main() {
   try {
     let builder = lucid.newTx();
 
-    // attach relevant policies
     for (const pid of Object.keys(burnByPolicy)) {
       const native = nativePolicies[pid];
       if (!native) throw new Error("Missing native policy " + pid);
       builder = builder.attachMintingPolicy(native);
     }
 
-    // add one mintAssets() per policy with negative counts
     for (const pid of Object.keys(burnByPolicy)) {
-      const assets = burnByPolicy[pid];
-      builder = builder.mintAssets(assets);
+      builder = builder.mintAssets(burnByPolicy[pid]);
     }
 
-    // pay fees from wallet
     const tx = await builder.complete();
 
-    // ✅ DRY-RUN safeguard
+    // 🧪 Dry-run (no submission)
     if (DRY_RUN) {
       console.log("──────────────────────────────────────────────");
       console.log("Dry-run mode ON — transaction NOT submitted.");
@@ -130,23 +142,19 @@ async function main() {
       for (const it of TO_BURN)
         console.log(` • ${it.policyId.slice(0,8)}…${it.policyId.slice(-6)} : ${it.name}`);
       console.log("──────────────────────────────────────────────");
-
       const fee = tx.txComplete.body().fee().to_str();
       console.log("Estimated minimum ADA fee:", fee);
       process.exit(0);
     }
-    
-  // sign with policy keys (raw ed25519 bytes) then wallet
-// sign with policy keys (raw ed25519 hex) then wallet
-let signed = tx;
-for (const pid of Object.keys(burnByPolicy)) {
-  const rawHex = policies[pid].rawHex;
-  const cleanHex = rawHex.startsWith("5820") ? rawHex.slice(4) : rawHex; // strip CBOR if present
-  signed = await signed.signWithPrivateKey(cleanHex);
-}
-signed = await signed.sign().complete();
 
-
+    // 🔐 Sign with both policy keys and wallet
+    let signed = tx;
+    for (const pid of Object.keys(burnByPolicy)) {
+      const bech = policies[pid].bech32;
+      console.log(`Signing with policy ${pid.slice(0,8)}...`);
+      signed = await signed.signWithPrivateKey(bech);
+    }
+    signed = await signed.sign().complete();
 
     // 🪓 Submit
     const txHash = await signed.submit();
