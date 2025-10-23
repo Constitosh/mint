@@ -4,11 +4,10 @@
 // It will burn 1 unit of each listed asset under its policy.
 
 import fs from "fs";
-import { Lucid, Blockfrost, C } from "lucid-cardano";
+import { Lucid, Blockfrost } from "lucid-cardano";
 import { CONFIG } from "../src/config.js"; // adjust path if needed
 
 // EDIT THIS: list of assets to burn (policy + plain name)
-// Example: { policyId: "0ecb97...", name: "2056_35" }
 const TO_BURN = [
   // ===== TRIX policy =====
   { policyId: "0ecb97dba8b3dbcaf004410717df9a214d526b1732bc88d14ca58237", name: "2056_2" },
@@ -41,35 +40,32 @@ const TO_BURN = [
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_84" },
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_86" },
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_90" },
+  { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "tddtddCXXXI-0040" },
 ];
 
 // Toggle true to only simulate (no submission)
 const DRY_RUN = false;
 
-// path to policy script JSON and skey for that policy (adjust names)
+// Paths to policy script and key files
 const TRIX_POLICY_FILE = "./policies/trix2056/policy.script";
 const TRIX_SKEY_FILE   = "./policies/trix2056/policy.skey";
 const TDD_POLICY_FILE  = "./policies/tdd/policy.script";
 const TDD_SKEY_FILE    = "./policies/tdd/policy.skey";
 
 // wallet seed (the hot wallet that holds tokens & will pay fees)
-// Make sure CONFIG.seedPhrase is correct and present in your config
 const SEED = CONFIG.seedPhrase;
 
-function readCborHex(path) {
-  return JSON.parse(fs.readFileSync(path, "utf8")).cborHex;
-}
-function skeyCborHexToBech32(cborHex) {
-  const bytes = Buffer.from(cborHex, "hex");
-  const isCborBytes = bytes.length === 34 && bytes[0] === 0x58 && bytes[1] === 0x20;
-  const raw = isCborBytes ? bytes.slice(2) : bytes;
-  const prv = C.PrivateKey.from_normal_bytes(raw);
-  return prv.to_bech32();
+// --- Helper: read raw ed25519 key bytes from CLI JSON skey ---
+function readPolicyKey(path) {
+  const json = JSON.parse(fs.readFileSync(path, "utf8"));
+  // strip CBOR prefix (5820 = 0x58 0x20) if present
+  if (json.cborHex.startsWith("5820")) return json.cborHex.slice(4);
+  return json.cborHex;
 }
 
 async function main() {
   if (!TO_BURN.length) {
-    console.log("No assets in TO_BURN. Edit scripts/burn.js and add entries. Exiting.");
+    console.log("No assets in TO_BURN. Exiting.");
     process.exit(1);
   }
 
@@ -84,12 +80,12 @@ async function main() {
   // TRIX
   policies[CONFIG.trixPolicyId] = {
     scriptJson: JSON.parse(fs.readFileSync(TRIX_POLICY_FILE, "utf8")),
-    skeyBech: skeyCborHexToBech32(readCborHex(TRIX_SKEY_FILE))
+    rawHex: readPolicyKey(TRIX_SKEY_FILE)
   };
   // TDD
   policies[CONFIG.tddPolicyId] = {
     scriptJson: JSON.parse(fs.readFileSync(TDD_POLICY_FILE, "utf8")),
-    skeyBech: skeyCborHexToBech32(readCborHex(TDD_SKEY_FILE))
+    rawHex: readPolicyKey(TDD_SKEY_FILE)
   };
 
   // convert scripts -> native policies Lucid understands
@@ -99,18 +95,15 @@ async function main() {
   }
 
   // build mint object: negative counts to burn
-  // Note: Lucid requires ONE mintAssets() call per policy (it is allowed to chain)
-  // We'll aggregate per policy
   const burnByPolicy = {};
   for (const it of TO_BURN) {
     if (!burnByPolicy[it.policyId]) burnByPolicy[it.policyId] = {};
     const hexName = Buffer.from(it.name, "utf8").toString("hex");
     const unit = it.policyId + hexName;
-    // burn 1 copy
     burnByPolicy[it.policyId][unit] = -1n;
   }
 
-    try {
+  try {
     let builder = lucid.newTx();
 
     // attach relevant policies
@@ -122,14 +115,14 @@ async function main() {
 
     // add one mintAssets() per policy with negative counts
     for (const pid of Object.keys(burnByPolicy)) {
-      const assets = burnByPolicy[pid]; // { unit: -1n, ... }
+      const assets = burnByPolicy[pid];
       builder = builder.mintAssets(assets);
     }
 
-    // pay fees from wallet (no outputs needed because we are burning tokens)
-    const tx = await builder.complete();   // build once
+    // pay fees from wallet
+    const tx = await builder.complete();
 
-    // ✅ DRY-RUN mode safeguard
+    // ✅ DRY-RUN safeguard
     if (DRY_RUN) {
       console.log("──────────────────────────────────────────────");
       console.log("Dry-run mode ON — transaction NOT submitted.");
@@ -138,23 +131,20 @@ async function main() {
         console.log(` • ${it.policyId.slice(0,8)}…${it.policyId.slice(-6)} : ${it.name}`);
       console.log("──────────────────────────────────────────────");
 
-      // show fee from the already built tx
       const fee = tx.txComplete.body().fee().to_str();
       console.log("Estimated minimum ADA fee:", fee);
       process.exit(0);
     }
 
-      console.log("TRIX skeyBech:", policies[CONFIG.trixPolicyId].skeyBech.slice(0,30) + "...");
-
-    // sign with policy keys (bech32) then sign with wallet
+    // sign with policy keys (raw ed25519 bytes) then wallet
     let signed = tx;
     for (const pid of Object.keys(burnByPolicy)) {
-      const skey = policies[pid].skeyBech;
-      signed = await signed.signWithPrivateKey(skey);
+      const rawHex = policies[pid].rawHex;
+      signed = await signed.signWithPrivateKey(rawHex);
     }
     signed = await signed.sign().complete();
 
-    // 🪓 Real submission
+    // 🪓 Submit
     const txHash = await signed.submit();
     console.log("✅ Burn tx submitted:", txHash);
     process.exit(0);
