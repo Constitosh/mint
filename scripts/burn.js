@@ -48,7 +48,7 @@ const TO_BURN = [
 ];
 
 // ✅ Toggle to test without sending a real transaction
-const DRY_RUN = false;
+const DRY_RUN = true;
 
 // =======================================
 // 🗝️ FILE PATHS
