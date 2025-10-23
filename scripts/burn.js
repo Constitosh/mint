@@ -111,7 +111,7 @@ async function main() {
     burnByPolicy[it.policyId][unit] = -1n;
   }
 
-  try {
+    try {
     let builder = lucid.newTx();
 
     // attach relevant policies
@@ -128,15 +128,7 @@ async function main() {
     }
 
     // pay fees from wallet (no outputs needed because we are burning tokens)
-    const tx = await builder.complete();
-
-    // sign with policy keys (bech32) then sign with wallet
-    let signed = tx;
-    for (const pid of Object.keys(burnByPolicy)) {
-      const skey = policies[pid].skeyBech;
-      signed = await signed.signWithPrivateKey(skey);
-    }
-    signed = await signed.sign().complete();
+    const tx = await builder.complete();   // build once
 
     // ✅ DRY-RUN mode safeguard
     if (DRY_RUN) {
@@ -147,11 +139,19 @@ async function main() {
         console.log(` • ${it.policyId.slice(0,8)}…${it.policyId.slice(-6)} : ${it.name}`);
       console.log("──────────────────────────────────────────────");
 
-      // Build but don't submit — just estimate the fee
-      const built = await builder.complete();
-      console.log("Estimated minimum ADA fee:", built.body().fee().to_str());
+      // show fee from the already built tx
+      const fee = tx.txComplete.body().fee().to_str();
+      console.log("Estimated minimum ADA fee:", fee);
       process.exit(0);
     }
+
+    // sign with policy keys (bech32) then sign with wallet
+    let signed = tx;
+    for (const pid of Object.keys(burnByPolicy)) {
+      const skey = policies[pid].skeyBech;
+      signed = await signed.signWithPrivateKey(skey);
+    }
+    signed = await signed.sign().complete();
 
     // 🪓 Real submission
     const txHash = await signed.submit();
@@ -165,4 +165,3 @@ async function main() {
 }
 
 main();
-
