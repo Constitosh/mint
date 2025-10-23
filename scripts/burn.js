@@ -6,6 +6,7 @@ import fs from "fs";
 import fetch from "node-fetch";
 import { Lucid, Blockfrost } from "lucid-cardano";
 import { CONFIG } from "../src/config.js";
+import { C } from "lucid-cardano"; // make sure it's imported at the top
 
 // =======================================
 // 🔥 LIST OF ASSETS TO BURN
@@ -207,16 +208,17 @@ async function main() {
       process.exit(0);
     }
 
-// 🔐 Sign with CBOR-encoded private keys (Lucid expects 5820-prefixed)
+// 🔐 Sign with PrivateKey objects (bypasses hex/bech32 parsing issues)
 let signed = tx;
 for (const pid of Object.keys(burnByPolicy)) {
-  let raw = policies[pid].raw;               // plain 32-byte hex
-  if (!raw.startsWith("5820")) raw = "5820" + raw; // add CBOR tag if missing
+  const raw = policies[pid].raw;               // 32-byte hex (no prefix)
+  const full = raw.startsWith("5820") ? raw : "5820" + raw;
+  const bytes = Buffer.from(full.slice(4), "hex");
+  const prv = C.PrivateKey.from_normal_bytes(bytes);
   console.log(`Signing with policy ${pid.slice(0,8)}…`);
-  signed = await signed.signWithPrivateKey(raw);
+  signed = await signed.signWithPrivateKey(prv);
 }
 signed = await signed.sign().complete();
-
 
     const txHash = await signed.submit();
     console.log("✅ Burn tx submitted:", txHash);
