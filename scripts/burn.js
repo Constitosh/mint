@@ -45,7 +45,7 @@ const TO_BURN = [
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "tddtddCXXXI-0040" },
 ];
 
-const DRY_RUN = true;
+const DRY_RUN = false;
 
 // =======================================
 // 🗝️ FILE PATHS
