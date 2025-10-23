@@ -4,7 +4,7 @@
 
 import fs from "fs";
 import fetch from "node-fetch";
-import { Lucid, Blockfrost, C } from "lucid-cardano";
+import { Lucid, Blockfrost } from "lucid-cardano";
 import { CONFIG } from "../src/config.js";
 
 // =======================================
@@ -62,17 +62,14 @@ const SEED = CONFIG.seedPhrase;
 // =======================================
 // 🔧 HELPERS
 // =======================================
-function readPolicyKey(path) {
+
+// Return raw 32-byte private key hex (strip CBOR prefix 5820 if present)
+function readPolicyKeyRaw(path) {
   const json = JSON.parse(fs.readFileSync(path, "utf8"));
-  let hex = json.cborHex;
-  if (hex.startsWith("5820")) hex = hex.slice(4); // remove CBOR prefix
-  return hex;
+  const hex = json.cborHex || json.cborhex || "";
+  return hex.startsWith("5820") ? hex.slice(4) : hex;
 }
-function toBech32FromHexKey(hex) {
-  const bytes = Buffer.from(hex, "hex");
-  const prv = C.PrivateKey.from_normal_bytes(bytes);
-  return prv.to_bech32(); // ed25519_sk1...
-}
+
 function toUnit(policyId, assetName) {
   const hexName = Buffer.from(assetName, "utf8").toString("hex");
   return policyId + hexName;
@@ -125,17 +122,15 @@ async function main() {
   const walletAddr = await lucid.wallet.address();
   console.log("🔥 Using wallet address:", walletAddr);
 
-  // Load both policy objects
+  // Load both policies and raw private keys (no bech32 conversion)
   const policies = {};
-  const trixHex = readPolicyKey(TRIX_SKEY_FILE);
   policies[CONFIG.trixPolicyId] = {
     scriptJson: JSON.parse(fs.readFileSync(TRIX_POLICY_FILE, "utf8")),
-    bech32: toBech32FromHexKey(trixHex)
+    raw: readPolicyKeyRaw(TRIX_SKEY_FILE),
   };
-  const tddHex = readPolicyKey(TDD_SKEY_FILE);
   policies[CONFIG.tddPolicyId] = {
     scriptJson: JSON.parse(fs.readFileSync(TDD_POLICY_FILE, "utf8")),
-    bech32: toBech32FromHexKey(tddHex)
+    raw: readPolicyKeyRaw(TDD_SKEY_FILE),
   };
 
   // Convert to native scripts & sanity-check policy IDs
@@ -157,7 +152,7 @@ async function main() {
     allUnits.push(unit);
   }
 
-  // 🧩 Verify holdings + get UTxOs
+  // Verify holdings + get UTxOs
   console.log("Checking wallet holdings via Blockfrost...");
   const check = await walletHasAssets(CONFIG.blockfrostKey, walletAddr, allUnits);
   if (!check.ok) {
@@ -167,7 +162,7 @@ async function main() {
   }
   console.log("✅ All assets are present in the wallet.");
 
-  // 🔎 Choose the exact UTxOs that carry each asset unit
+  // Choose the exact UTxOs that carry each asset unit
   const chosen = pickUtxosForUnits(check.utxos, allUnits);
   if (chosen.size !== allUnits.length) {
     console.error("🚫 Could not find a UTxO for every unit. Missing:");
@@ -176,7 +171,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Convert Blockfrost UTxO shape -> Lucid UTxO shape
   const toLucidUtxo = (bf) => ({
     txHash: bf.tx_hash,
     outputIndex: bf.output_index,
@@ -188,10 +182,8 @@ async function main() {
   const utxosToCollect = [...chosen.values()].map(toLucidUtxo);
 
   try {
-    let builder = lucid.newTx();
-
-    // Collect the UTxOs that hold the tokens we’re burning
-    builder = builder.collectFrom(utxosToCollect);
+    let builder = lucid.newTx()
+      .collectFrom(utxosToCollect);
 
     // Attach policies and add negative mints
     for (const pid of Object.keys(burnByPolicy)) {
@@ -214,12 +206,12 @@ async function main() {
       process.exit(0);
     }
 
-    // Sign with both policy keys + wallet
+    // 🔐 Sign with raw CBOR private keys (no bech32) + wallet
     let signed = tx;
     for (const pid of Object.keys(burnByPolicy)) {
-      const bech = policies[pid].bech32;
+      const raw = policies[pid].raw;            // 64-char hex (32 bytes), CBOR prefix already stripped
       console.log(`Signing with policy ${pid.slice(0,8)}…`);
-      signed = await signed.signWithPrivateKey(bech);
+      signed = await signed.signWithPrivateKey(raw);
     }
     signed = await signed.sign().complete();
 
