@@ -44,7 +44,7 @@ const TO_BURN = [
 ];
 
 // Toggle true to only simulate (no submission)
-const DRY_RUN = true;
+const DRY_RUN = false;
 
 // Paths to policy script and key files
 const TRIX_POLICY_FILE = "./policies/trix2056/policy.script";
