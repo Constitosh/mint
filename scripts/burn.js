@@ -44,7 +44,7 @@ const TO_BURN = [
 ];
 
 // Toggle true to only simulate (no submission)
-const DRY_RUN = false;
+const DRY_RUN = true;
 
 // Paths to policy script and key files
 const TRIX_POLICY_FILE = "./policies/trix2056/policy.script";
@@ -135,14 +135,16 @@ async function main() {
       console.log("Estimated minimum ADA fee:", fee);
       process.exit(0);
     }
+    
+  // sign with policy keys (raw ed25519 bytes) then wallet
+let signed = tx;
+for (const pid of Object.keys(burnByPolicy)) {
+  const rawHex = policies[pid].rawHex;
+  const keyBytes = Buffer.from(rawHex, "hex"); // decode to bytes
+  signed = await signed.signWithPrivateKey(keyBytes);
+}
+signed = await signed.sign().complete();
 
-    // sign with policy keys (raw ed25519 bytes) then wallet
-    let signed = tx;
-    for (const pid of Object.keys(burnByPolicy)) {
-      const rawHex = policies[pid].rawHex;
-      signed = await signed.signWithPrivateKey(rawHex);
-    }
-    signed = await signed.sign().complete();
 
     // 🪓 Submit
     const txHash = await signed.submit();
