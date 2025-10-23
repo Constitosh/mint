@@ -46,7 +46,7 @@ const TO_BURN = [
 ];
 
 // ✅ Toggle to test without sending a real transaction
-const DRY_RUN = false;
+const DRY_RUN = true;
 
 // =======================================
 // 🗝️ FILE PATHS
@@ -206,14 +206,16 @@ async function main() {
       process.exit(0);
     }
 
-    // 🔐 Sign with raw CBOR private keys (no bech32) + wallet
-    let signed = tx;
-    for (const pid of Object.keys(burnByPolicy)) {
-      const raw = policies[pid].raw;            // 64-char hex (32 bytes), CBOR prefix already stripped
-      console.log(`Signing with policy ${pid.slice(0,8)}…`);
-      signed = await signed.signWithPrivateKey(raw);
-    }
-    signed = await signed.sign().complete();
+// 🔐 Sign with CBOR-encoded private keys (Lucid expects 5820-prefixed)
+let signed = tx;
+for (const pid of Object.keys(burnByPolicy)) {
+  let raw = policies[pid].raw;               // plain 32-byte hex
+  if (!raw.startsWith("5820")) raw = "5820" + raw; // add CBOR tag if missing
+  console.log(`Signing with policy ${pid.slice(0,8)}…`);
+  signed = await signed.signWithPrivateKey(raw);
+}
+signed = await signed.sign().complete();
+
 
     const txHash = await signed.submit();
     console.log("✅ Burn tx submitted:", txHash);
