@@ -44,6 +44,8 @@ const TO_BURN = [
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "tddtddCXXXI-0040" },
 ];
 
+// Toggle true to only simulate (no submission)
+const DRY_RUN = true;
 
 // path to policy script JSON and skey for that policy (adjust names)
 const TRIX_POLICY_FILE = "./policies/trix2056/policy.script";
@@ -136,9 +138,26 @@ async function main() {
     }
     signed = await signed.sign().complete();
 
+    // ✅ DRY-RUN mode safeguard
+    if (DRY_RUN) {
+      console.log("──────────────────────────────────────────────");
+      console.log("Dry-run mode ON — transaction NOT submitted.");
+      console.log("Would burn these assets:");
+      for (const it of TO_BURN)
+        console.log(` • ${it.policyId.slice(0,8)}…${it.policyId.slice(-6)} : ${it.name}`);
+      console.log("──────────────────────────────────────────────");
+
+      // Build but don't submit — just estimate the fee
+      const built = await builder.complete();
+      console.log("Estimated minimum ADA fee:", built.body().fee().to_str());
+      process.exit(0);
+    }
+
+    // 🪓 Real submission
     const txHash = await signed.submit();
-    console.log("Burn tx submitted:", txHash);
+    console.log("✅ Burn tx submitted:", txHash);
     process.exit(0);
+
   } catch (e) {
     console.error("Burn failed:", e);
     process.exit(1);
@@ -146,3 +165,4 @@ async function main() {
 }
 
 main();
+
