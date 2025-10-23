@@ -4,12 +4,11 @@
 
 import fs from "fs";
 import fetch from "node-fetch";
-import { Lucid, Blockfrost } from "lucid-cardano";
+import { Lucid, Blockfrost, C } from "lucid-cardano";
 import { CONFIG } from "../src/config.js";
-import { C } from "lucid-cardano"; // make sure it's imported at the top
 
 // =======================================
-// 🔥 LIST OF ASSETS TO BURN
+// 🔥 ASSETS TO BURN
 // =======================================
 const TO_BURN = [
   // ===== TRIX policy =====
@@ -28,7 +27,6 @@ const TO_BURN = [
   { policyId: "0ecb97dba8b3dbcaf004410717df9a214d526b1732bc88d14ca58237", name: "2056_104" },
   { policyId: "0ecb97dba8b3dbcaf004410717df9a214d526b1732bc88d14ca58237", name: "2056_111" },
 
-  
   // ===== TDD policy =====
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_18" },
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "DDCXXXII_25" },
@@ -47,8 +45,7 @@ const TO_BURN = [
   { policyId: "a6483566f21614f3587273fa965edec30917dbd2b62d7c08d6a89dfb", name: "tddtddCXXXI-0040" },
 ];
 
-// ✅ Toggle to test without sending a real transaction
-const DRY_RUN = false;
+const DRY_RUN = true;
 
 // =======================================
 // 🗝️ FILE PATHS
@@ -57,27 +54,20 @@ const TRIX_POLICY_FILE = "./policies/trix2056/policy.script";
 const TRIX_SKEY_FILE   = "./policies/trix2056/policy.skey";
 const TDD_POLICY_FILE  = "./policies/tdd/policy.script";
 const TDD_SKEY_FILE    = "./policies/tdd/policy.skey";
-
-// Wallet seed for fees
 const SEED = CONFIG.seedPhrase;
 
 // =======================================
 // 🔧 HELPERS
 // =======================================
-
-// Return raw 32-byte private key hex (strip CBOR prefix 5820 if present)
 function readPolicyKeyRaw(path) {
   const json = JSON.parse(fs.readFileSync(path, "utf8"));
   const hex = json.cborHex || json.cborhex || "";
   return hex.startsWith("5820") ? hex.slice(4) : hex;
 }
-
 function toUnit(policyId, assetName) {
   const hexName = Buffer.from(assetName, "utf8").toString("hex");
   return policyId + hexName;
 }
-
-// 🔍 Check wallet holdings before burning (via Blockfrost)
 async function walletHasAssets(blockfrostKey, walletAddr, units) {
   const missing = [];
   const resp = await fetch(`https://cardano-mainnet.blockfrost.io/api/v0/addresses/${walletAddr}/utxos`, {
@@ -90,11 +80,9 @@ async function walletHasAssets(blockfrostKey, walletAddr, units) {
   for (const u of units) if (!owned.has(u)) missing.push(u);
   return { ok: missing.length === 0, missing, utxos };
 }
-
-// Map each unit → one UTxO that contains it (so we can collectFrom() exactly those)
 function pickUtxosForUnits(utxos, units) {
   const unitSet = new Set(units);
-  const chosen = new Map(); // unit -> utxo
+  const chosen = new Map();
   for (const utxo of utxos) {
     for (const amt of utxo.amount) {
       if (unitSet.has(amt.unit) && !chosen.has(amt.unit) && BigInt(amt.quantity) > 0n) {
@@ -124,18 +112,17 @@ async function main() {
   const walletAddr = await lucid.wallet.address();
   console.log("🔥 Using wallet address:", walletAddr);
 
-  // Load both policies and raw private keys (no bech32 conversion)
-  const policies = {};
-  policies[CONFIG.trixPolicyId] = {
-    scriptJson: JSON.parse(fs.readFileSync(TRIX_POLICY_FILE, "utf8")),
-    raw: readPolicyKeyRaw(TRIX_SKEY_FILE),
-  };
-  policies[CONFIG.tddPolicyId] = {
-    scriptJson: JSON.parse(fs.readFileSync(TDD_POLICY_FILE, "utf8")),
-    raw: readPolicyKeyRaw(TDD_SKEY_FILE),
+  const policies = {
+    [CONFIG.trixPolicyId]: {
+      scriptJson: JSON.parse(fs.readFileSync(TRIX_POLICY_FILE, "utf8")),
+      raw: readPolicyKeyRaw(TRIX_SKEY_FILE),
+    },
+    [CONFIG.tddPolicyId]: {
+      scriptJson: JSON.parse(fs.readFileSync(TDD_POLICY_FILE, "utf8")),
+      raw: readPolicyKeyRaw(TDD_SKEY_FILE),
+    },
   };
 
-  // Convert to native scripts & sanity-check policy IDs
   const nativePolicies = {};
   for (const pid of Object.keys(policies)) {
     const native = lucid.utils.nativeScriptFromJson(policies[pid].scriptJson);
@@ -144,17 +131,15 @@ async function main() {
     nativePolicies[pid] = native;
   }
 
-  // Build burn map and collect all units
   const burnByPolicy = {};
   const allUnits = [];
   for (const it of TO_BURN) {
     if (!burnByPolicy[it.policyId]) burnByPolicy[it.policyId] = {};
     const unit = toUnit(it.policyId, it.name);
-    burnByPolicy[it.policyId][unit] = -1n; // burn 1
+    burnByPolicy[it.policyId][unit] = -1n;
     allUnits.push(unit);
   }
 
-  // Verify holdings + get UTxOs
   console.log("Checking wallet holdings via Blockfrost...");
   const check = await walletHasAssets(CONFIG.blockfrostKey, walletAddr, allUnits);
   if (!check.ok) {
@@ -164,7 +149,6 @@ async function main() {
   }
   console.log("✅ All assets are present in the wallet.");
 
-  // Choose the exact UTxOs that carry each asset unit
   const chosen = pickUtxosForUnits(check.utxos, allUnits);
   if (chosen.size !== allUnits.length) {
     console.error("🚫 Could not find a UTxO for every unit. Missing:");
@@ -177,23 +161,18 @@ async function main() {
     txHash: bf.tx_hash,
     outputIndex: bf.output_index,
     address: bf.address,
-    assets: Object.fromEntries(
-      bf.amount.map((a) => [a.unit === "lovelace" ? "lovelace" : a.unit, BigInt(a.quantity)])
-    )
+    assets: Object.fromEntries(bf.amount.map((a) => [a.unit === "lovelace" ? "lovelace" : a.unit, BigInt(a.quantity)])),
   });
   const utxosToCollect = [...chosen.values()].map(toLucidUtxo);
 
   try {
-    let builder = lucid.newTx()
-      .collectFrom(utxosToCollect);
+    let builder = lucid.newTx().collectFrom(utxosToCollect);
 
-    // Attach policies and add negative mints
-    for (const pid of Object.keys(burnByPolicy)) {
-      builder = builder.attachMintingPolicy(nativePolicies[pid]);
-    }
-    for (const pid of Object.keys(burnByPolicy)) {
-      builder = builder.mintAssets(burnByPolicy[pid]);
-    }
+    for (const pid of Object.keys(burnByPolicy)) builder = builder.attachMintingPolicy(nativePolicies[pid]);
+    for (const pid of Object.keys(burnByPolicy)) builder = builder.mintAssets(burnByPolicy[pid]);
+
+    // ✅ required for "before" in TRIX policy
+    builder = builder.validTo(Date.now() + 10 * 60 * 1000);
 
     const tx = await builder.complete();
 
@@ -208,38 +187,35 @@ async function main() {
       process.exit(0);
     }
 
-// 🔐 Sign with PrivateKey objects (bypasses hex/bech32 parsing issues)
-let signed = tx;
+    // 🔐 Sign manually with raw PrivateKeys
+    let signed = tx;
+    for (const pid of Object.keys(burnByPolicy)) {
+      console.log(`Signing with policy ${pid.slice(0,8)}…`);
+      const raw = policies[pid].raw;
+      const hex = raw.startsWith("5820") ? raw.slice(4) : raw;
+      const prv = C.PrivateKey.from_normal_bytes(Buffer.from(hex, "hex"));
 
-// manually sign for each minting key
-for (const pid of Object.keys(burnByPolicy)) {
-  console.log(`Signing with policy ${pid.slice(0,8)}…`);
+      const txBody = signed.txComplete.body();
+      const txHash = C.hash_transaction(txBody);
+      const vkeyWitnesses = C.Vkeywitnesses.new();
+      const vkeywitness = C.make_vkey_witness(txHash, prv);
+      vkeyWitnesses.add(vkeywitness);
 
-  const raw = policies[pid].raw; // 32-byte hex
-  const hex = raw.startsWith("5820") ? raw.slice(4) : raw;
-  const prv = C.PrivateKey.from_normal_bytes(Buffer.from(hex, "hex"));
+      const witnessSet = signed.txComplete.witness_set();
+      const existing = witnessSet.vkeys();
+      if (existing) {
+        for (let i = 0; i < existing.len(); i++) vkeyWitnesses.add(existing.get(i));
+      }
+      witnessSet.set_vkeys(vkeyWitnesses);
+      signed.txComplete = C.Transaction.new(txBody, witnessSet);
+    }
 
-  // Build witness manually
-  const txBody = signed.txComplete.body();
-  const txHash = C.hash_transaction(txBody);
-  const vkeyWitnesses = C.Vkeywitnesses.new();
-  const vkeywitness = C.make_vkey_witness(txHash, prv);
-  vkeyWitnesses.add(vkeywitness);
-
-  const witnessSet = signed.txComplete.witness_set();
-  witnessSet.set_vkeys(vkeyWitnesses);
-  const signedTx = C.Transaction.new(txBody, witnessSet);
-
-  // Replace lucid’s internal txComplete with our signed one
-  signed.txComplete = signedTx;
-}
-
-// now sign with wallet seed (normal lucid path)
-signed = await signed.sign().complete();
+    signed = await signed.sign().complete();
 
     const txHash = await signed.submit();
     console.log("✅ Burn tx submitted:", txHash);
     process.exit(0);
+
   } catch (e) {
     console.error("Burn failed:", e);
     process.exit(1);
