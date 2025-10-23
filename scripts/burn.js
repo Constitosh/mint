@@ -46,7 +46,7 @@ const TO_BURN = [
 ];
 
 // ✅ Toggle to test without sending a real transaction
-const DRY_RUN = false;
+const DRY_RUN = true;
 
 // =======================================
 // 🗝️ FILE PATHS
@@ -68,14 +68,17 @@ function readPolicyKey(path) {
   if (hex.startsWith("5820")) hex = hex.slice(4); // remove CBOR prefix
   return hex;
 }
-
 function toBech32FromHexKey(hex) {
   const bytes = Buffer.from(hex, "hex");
   const prv = C.PrivateKey.from_normal_bytes(bytes);
   return prv.to_bech32(); // ed25519_sk1...
 }
+function toUnit(policyId, assetName) {
+  const hexName = Buffer.from(assetName, "utf8").toString("hex");
+  return policyId + hexName;
+}
 
-// 🔍 Check wallet holdings before burning
+// 🔍 Check wallet holdings before burning (via Blockfrost)
 async function walletHasAssets(blockfrostKey, walletAddr, units) {
   const missing = [];
   const resp = await fetch(`https://cardano-mainnet.blockfrost.io/api/v0/addresses/${walletAddr}/utxos`, {
@@ -83,18 +86,25 @@ async function walletHasAssets(blockfrostKey, walletAddr, units) {
   });
   if (!resp.ok) throw new Error("Blockfrost utxo fetch failed: " + resp.status);
   const utxos = await resp.json();
-
   const owned = new Set();
-  for (const u of utxos) {
-    for (const amt of u.amount) {
-      if (amt.unit !== "lovelace") owned.add(amt.unit);
-    }
-  }
+  for (const u of utxos) for (const amt of u.amount) if (amt.unit !== "lovelace") owned.add(amt.unit);
+  for (const u of units) if (!owned.has(u)) missing.push(u);
+  return { ok: missing.length === 0, missing, utxos };
+}
 
-  for (const u of units) {
-    if (!owned.has(u)) missing.push(u);
+// Map each unit → one UTxO that contains it (so we can collectFrom() exactly those)
+function pickUtxosForUnits(utxos, units) {
+  const unitSet = new Set(units);
+  const chosen = new Map(); // unit -> utxo
+  for (const utxo of utxos) {
+    for (const amt of utxo.amount) {
+      if (unitSet.has(amt.unit) && !chosen.has(amt.unit) && BigInt(amt.quantity) > 0n) {
+        chosen.set(amt.unit, utxo);
+      }
+    }
+    if (chosen.size === unitSet.size) break;
   }
-  return { ok: missing.length === 0, missing };
+  return chosen;
 }
 
 // =======================================
@@ -128,23 +138,26 @@ async function main() {
     bech32: toBech32FromHexKey(tddHex)
   };
 
+  // Convert to native scripts & sanity-check policy IDs
   const nativePolicies = {};
   for (const pid of Object.keys(policies)) {
-    nativePolicies[pid] = lucid.utils.nativeScriptFromJson(policies[pid].scriptJson);
+    const native = lucid.utils.nativeScriptFromJson(policies[pid].scriptJson);
+    const computed = lucid.utils.mintingPolicyToId(native);
+    if (computed !== pid) throw new Error(`PolicyId mismatch for ${pid.slice(0,8)}… — computed ${computed}`);
+    nativePolicies[pid] = native;
   }
 
-  // Build burn map and collect all asset units
+  // Build burn map and collect all units
   const burnByPolicy = {};
   const allUnits = [];
   for (const it of TO_BURN) {
     if (!burnByPolicy[it.policyId]) burnByPolicy[it.policyId] = {};
-    const hexName = Buffer.from(it.name, "utf8").toString("hex");
-    const unit = it.policyId + hexName;
-    burnByPolicy[it.policyId][unit] = -1n;
+    const unit = toUnit(it.policyId, it.name);
+    burnByPolicy[it.policyId][unit] = -1n; // burn 1
     allUnits.push(unit);
   }
 
-  // 🧩 Verify holdings
+  // 🧩 Verify holdings + get UTxOs
   console.log("Checking wallet holdings via Blockfrost...");
   const check = await walletHasAssets(CONFIG.blockfrostKey, walletAddr, allUnits);
   if (!check.ok) {
@@ -152,13 +165,37 @@ async function main() {
     for (const u of check.missing) console.error(" - " + u);
     process.exit(1);
   }
-  console.log("✅ All assets are present in the wallet. Proceeding with burn.");
+  console.log("✅ All assets are present in the wallet.");
+
+  // 🔎 Choose the exact UTxOs that carry each asset unit
+  const chosen = pickUtxosForUnits(check.utxos, allUnits);
+  if (chosen.size !== allUnits.length) {
+    console.error("🚫 Could not find a UTxO for every unit. Missing:");
+    const chosenSet = new Set([...chosen.keys()]);
+    for (const u of allUnits) if (!chosenSet.has(u)) console.error(" - " + u);
+    process.exit(1);
+  }
+
+  // Convert Blockfrost UTxO shape -> Lucid UTxO shape
+  const toLucidUtxo = (bf) => ({
+    txHash: bf.tx_hash,
+    outputIndex: bf.output_index,
+    address: bf.address,
+    assets: Object.fromEntries(
+      bf.amount.map((a) => [a.unit === "lovelace" ? "lovelace" : a.unit, BigInt(a.quantity)])
+    )
+  });
+  const utxosToCollect = [...chosen.values()].map(toLucidUtxo);
 
   try {
     let builder = lucid.newTx();
+
+    // Collect the UTxOs that hold the tokens we’re burning
+    builder = builder.collectFrom(utxosToCollect);
+
+    // Attach policies and add negative mints
     for (const pid of Object.keys(burnByPolicy)) {
-      const native = nativePolicies[pid];
-      builder = builder.attachMintingPolicy(native);
+      builder = builder.attachMintingPolicy(nativePolicies[pid]);
     }
     for (const pid of Object.keys(burnByPolicy)) {
       builder = builder.mintAssets(burnByPolicy[pid]);
@@ -177,10 +214,11 @@ async function main() {
       process.exit(0);
     }
 
+    // Sign with both policy keys + wallet
     let signed = tx;
     for (const pid of Object.keys(burnByPolicy)) {
       const bech = policies[pid].bech32;
-      console.log(`Signing with policy ${pid.slice(0,8)}...`);
+      console.log(`Signing with policy ${pid.slice(0,8)}…`);
       signed = await signed.signWithPrivateKey(bech);
     }
     signed = await signed.sign().complete();
