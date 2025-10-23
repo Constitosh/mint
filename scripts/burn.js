@@ -137,13 +137,15 @@ async function main() {
     }
     
   // sign with policy keys (raw ed25519 bytes) then wallet
+// sign with policy keys (raw ed25519 hex) then wallet
 let signed = tx;
 for (const pid of Object.keys(burnByPolicy)) {
   const rawHex = policies[pid].rawHex;
-  const keyBytes = Buffer.from(rawHex, "hex"); // decode to bytes
-  signed = await signed.signWithPrivateKey(keyBytes);
+  const cleanHex = rawHex.startsWith("5820") ? rawHex.slice(4) : rawHex; // strip CBOR if present
+  signed = await signed.signWithPrivateKey(cleanHex);
 }
 signed = await signed.sign().complete();
+
 
 
     // 🪓 Submit
