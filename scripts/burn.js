@@ -48,7 +48,7 @@ const TO_BURN = [
 ];
 
 // ✅ Toggle to test without sending a real transaction
-const DRY_RUN = false;
+const DRY_RUN = true;
 
 // =======================================
 // 🗝️ FILE PATHS
@@ -210,14 +210,31 @@ async function main() {
 
 // 🔐 Sign with PrivateKey objects (bypasses hex/bech32 parsing issues)
 let signed = tx;
+
+// manually sign for each minting key
 for (const pid of Object.keys(burnByPolicy)) {
-  const raw = policies[pid].raw;               // 32-byte hex (no prefix)
-  const full = raw.startsWith("5820") ? raw : "5820" + raw;
-  const bytes = Buffer.from(full.slice(4), "hex");
-  const prv = C.PrivateKey.from_normal_bytes(bytes);
   console.log(`Signing with policy ${pid.slice(0,8)}…`);
-  signed = await signed.signWithPrivateKey(prv);
+
+  const raw = policies[pid].raw; // 32-byte hex
+  const hex = raw.startsWith("5820") ? raw.slice(4) : raw;
+  const prv = C.PrivateKey.from_normal_bytes(Buffer.from(hex, "hex"));
+
+  // Build witness manually
+  const txBody = signed.txComplete.body();
+  const txHash = C.hash_transaction(txBody);
+  const vkeyWitnesses = C.Vkeywitnesses.new();
+  const vkeywitness = C.make_vkey_witness(txHash, prv);
+  vkeyWitnesses.add(vkeywitness);
+
+  const witnessSet = signed.txComplete.witness_set();
+  witnessSet.set_vkeys(vkeyWitnesses);
+  const signedTx = C.Transaction.new(txBody, witnessSet);
+
+  // Replace lucid’s internal txComplete with our signed one
+  signed.txComplete = signedTx;
 }
+
+// now sign with wallet seed (normal lucid path)
 signed = await signed.sign().complete();
 
     const txHash = await signed.submit();
