@@ -123,6 +123,8 @@ async function main() {
       process.exit(0);
     }
 
+      console.log("TRIX skeyBech:", policies[CONFIG.trixPolicyId].skeyBech.slice(0,30) + "...");
+
     // sign with policy keys (bech32) then sign with wallet
     let signed = tx;
     for (const pid of Object.keys(burnByPolicy)) {
